@@ -3,6 +3,11 @@
  * Database export/import using $wpdb only — no mysqldump, no proc_open (both are blocked
  * by snuffleupagus on this fleet). Export streams a .sql file; import replays it and runs
  * a serialization-safe search/replace for the old site URL and table prefix.
+ *
+ * 0.1.5: an imported dump is untrusted. Before anything runs, every statement must be one of
+ * the shapes our own exporter writes (SET / DROP TABLE IF EXISTS / CREATE TABLE / INSERT INTO)
+ * on a table with this site's prefix. URL rewriting no longer calls unserialize() at all, so a
+ * crafted value cannot instantiate a PHP object during import.
  */
 
 if (!defined('ABSPATH')) {
@@ -11,7 +16,7 @@ if (!defined('ABSPATH')) {
 
 class PAIO_Database
 {
-    /** Dump every table for the current site's prefix into $sql_path. Returns table count. */
+    /** Dump every base table for the current site's prefix into $sql_path. Returns table count. */
     public static function export($sql_path)
     {
         global $wpdb;
@@ -33,12 +38,14 @@ class PAIO_Database
             fwrite($fh, "DROP TABLE IF EXISTS `$table`;\n");
             fwrite($fh, $create[1] . ";\n");
 
-            // Stream rows in batches so a big table never loads entirely into memory.
+            // Stream rows in batches so a big table never loads entirely into memory. Ordered by
+            // the primary key: OFFSET paging without ORDER BY may skip or repeat rows.
+            $order = self::order_by($table);
             $offset = 0;
             $batch = 500;
             do {
                 $rows = $wpdb->get_results(
-                    $wpdb->prepare('SELECT * FROM `' . $table . '` LIMIT %d OFFSET %d', $batch, $offset),
+                    $wpdb->prepare('SELECT * FROM `' . $table . '`' . $order . ' LIMIT %d OFFSET %d', $batch, $offset),
                     ARRAY_A
                 );
                 if ($rows) {
@@ -56,13 +63,37 @@ class PAIO_Database
         return count($tables);
     }
 
-    /** Tables that belong to this site (current prefix, incl. multisite blog tables). */
+    /**
+     * Base tables that belong to this site (current prefix, incl. multisite blog tables).
+     * Views are left out: SHOW CREATE TABLE on a view yields a CREATE VIEW, which import refuses.
+     */
     private static function site_tables()
     {
         global $wpdb;
         $like = $wpdb->esc_like($wpdb->prefix) . '%';
-        $rows = $wpdb->get_col($wpdb->prepare('SHOW TABLES LIKE %s', $like));
+        $rows = $wpdb->get_col($wpdb->prepare(
+            "SELECT TABLE_NAME FROM information_schema.TABLES
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE' AND TABLE_NAME LIKE %s
+             ORDER BY TABLE_NAME",
+            $like
+        ));
         return $rows ? $rows : array();
+    }
+
+    /** " ORDER BY <primary key columns>", or "" for a table without one. */
+    private static function order_by($table)
+    {
+        global $wpdb;
+        $keys = $wpdb->get_results('SHOW KEYS FROM `' . $table . "` WHERE Key_name = 'PRIMARY'", ARRAY_A);
+        if (!$keys) {
+            return '';
+        }
+        usort($keys, function ($a, $b) { return (int) $a['Seq_in_index'] - (int) $b['Seq_in_index']; });
+        $cols = array();
+        foreach ($keys as $k) {
+            $cols[] = '`' . str_replace('`', '', $k['Column_name']) . '`';
+        }
+        return ' ORDER BY ' . implode(',', $cols);
     }
 
     private static function insert_sql($table, $row)
@@ -91,62 +122,186 @@ class PAIO_Database
     }
 
     /**
-     * Import a .sql dump, rewriting the source prefix to this site's prefix and the source
-     * site URL to this site's URL (serialization-safe). $source is the manifest array.
-     * Statements are executed one at a time via $wpdb::query.
+     * Yields each statement of a dump, after prefix rewriting and (for dumps made by PAIO 0.1.1
+     * or earlier) restoring the leaked "%" placeholder token. Shared by validate() and import()
+     * so both see exactly the same statements.
      */
-    public static function import($sql_path, array $source)
+    private static function statements($sql_path, array $source)
     {
         global $wpdb;
-
-        $src_prefix = isset($source['prefix']) ? $source['prefix'] : $wpdb->prefix;
+        $src_prefix = isset($source['prefix']) ? (string) $source['prefix'] : $wpdb->prefix;
         $dst_prefix = $wpdb->prefix;
-        $src_url    = isset($source['siteurl']) ? untrailingslashit($source['siteurl']) : '';
-        $dst_url    = untrailingslashit(site_url());
-        $src_home   = isset($source['home']) ? untrailingslashit($source['home']) : '';
-        $dst_home   = untrailingslashit(home_url());
+
+        // Only dumps from before the 0.1.2 fix carry the token. Applying the repair to newer dumps
+        // replaced the first {64-hex} string found anywhere in real data, and then all copies of it.
+        $gen = isset($source['generator']) ? (string) $source['generator'] : '';
+        $legacy_token = preg_match('/^PAIO (\d+\.\d+\.\d+)/', $gen, $gm) && version_compare($gm[1], '0.1.2', '<');
 
         $fh = fopen($sql_path, 'rb');
         if (!$fh) {
             throw new RuntimeException('Cannot read DB dump.');
         }
-
         $buffer = '';
-        $count = 0;
-        $token = null;   // a 0.1.1 dump's leaked placeholder token (one per export), restored to "%"
-        while (!feof($fh)) {
-            $line = fgets($fh);
-            if ($line === false) {
-                break;
-            }
-            $trim = ltrim($line);
-            if ($trim === '' || substr($trim, 0, 2) === '--') {
-                continue;
-            }
-            $buffer .= $line;
-            // A statement ends at a line finishing with ";". Good enough for our own dumps
-            // because every value is on one INSERT line (no embedded newlines mid-statement
-            // except inside quoted data, which _real_escape turned into \n sequences).
-            if (preg_match('/;\s*$/', rtrim($line))) {
-                $stmt = trim($buffer);
-                $buffer = '';
-                if ($stmt === '') {
+        $no = 0;
+        $token = null;
+        try {
+            while (!feof($fh)) {
+                $line = fgets($fh);
+                if ($line === false) {
+                    break;
+                }
+                $trim = ltrim($line);
+                if ($buffer === '' && ($trim === '' || substr($trim, 0, 2) === '--')) {
                     continue;
                 }
-                if ($src_prefix !== $dst_prefix) {
-                    $stmt = self::rewrite_prefix($stmt, $src_prefix, $dst_prefix);
+                $buffer .= $line;
+                // A statement ends at a line finishing with ";". Our dumps put every INSERT on one
+                // line (newlines inside data are escaped as \n), and CREATE TABLE ends with ";".
+                if (preg_match('/;\s*$/', rtrim($line))) {
+                    $stmt = trim($buffer);
+                    $buffer = '';
+                    if ($stmt === '') {
+                        continue;
+                    }
+                    if ($src_prefix !== $dst_prefix) {
+                        $stmt = self::rewrite_prefix($stmt, $src_prefix, $dst_prefix);
+                    }
+                    if ($legacy_token) {
+                        if ($token === null && preg_match('/\{[0-9a-f]{64}\}/', $stmt, $m)) {
+                            $token = $m[0];
+                        }
+                        if ($token !== null) {
+                            $stmt = str_replace($token, '%', $stmt);
+                        }
+                    }
+                    $no++;
+                    yield $no => $stmt;
                 }
-                if ($token === null && preg_match('/\{[0-9a-f]{64}\}/', $stmt, $m)) {
-                    $token = $m[0];
+            }
+            if (trim($buffer) !== '') {
+                throw new RuntimeException('Database dump ends in the middle of a statement.');
+            }
+        } finally {
+            fclose($fh);
+        }
+    }
+
+    /**
+     * Checks one statement against the shapes PAIO's exporter writes. Returns null if allowed,
+     * else the reason. Every table must carry this site's prefix, so a dump cannot reach other
+     * installs that share the database.
+     */
+    public static function statement_problem($stmt, $prefix)
+    {
+        if (preg_match("/^SET SESSION sql_mode='[A-Z_,]*';$/", $stmt)
+            || preg_match('/^SET NAMES [a-z0-9_]+( COLLATE [a-z0-9_]+)?;$/', $stmt)
+            || preg_match('/^SET FOREIGN_KEY_CHECKS=[01];$/', $stmt)) {
+            return null;
+        }
+        $table_ok = function ($t) use ($prefix) {
+            return strpos($t, $prefix) === 0 && preg_match('/^[A-Za-z0-9_$]+$/', $t);
+        };
+        if (preg_match('/^DROP TABLE IF EXISTS `([^`]+)`;$/', $stmt, $m)) {
+            return $table_ok($m[1]) ? null : 'table ' . $m[1] . ' does not use this site\'s prefix ' . $prefix;
+        }
+        if (preg_match('/^INSERT INTO `([^`]+)` \((`[^`]+`)(,`[^`]+`)*\) VALUES \(/', $stmt, $m)) {
+            if (!$table_ok($m[1])) {
+                return 'table ' . $m[1] . ' does not use this site\'s prefix ' . $prefix;
+            }
+            return substr($stmt, -2) === ');' ? null : 'INSERT does not end with ");"';
+        }
+        if (preg_match('/^CREATE TABLE `([^`]+)` \(/', $stmt, $m)) {
+            if (!$table_ok($m[1])) {
+                return 'table ' . $m[1] . ' does not use this site\'s prefix ' . $prefix;
+            }
+            $close = self::matching_paren($stmt, strlen($m[0]) - 1);
+            if ($close === null) {
+                return 'unbalanced CREATE TABLE';
+            }
+            // Table options only: no "AS SELECT", no DATA/INDEX DIRECTORY, no CONNECTION.
+            $tail = preg_replace("/'(?:[^'\\\\]|\\\\.|'')*'/s", "''", substr($stmt, $close + 1));
+            if (!preg_match("/^[\\sA-Za-z0-9_=',]*;$/", $tail)
+                || preg_match('/\b(SELECT|DIRECTORY|CONNECTION|UNION|INSERT_METHOD)\b/i', $tail)) {
+                return 'CREATE TABLE has options PAIO never writes: ' . substr(trim($tail), 0, 80);
+            }
+            return null;
+        }
+        return 'not a statement PAIO writes';
+    }
+
+    /** Index of the ")" matching the "(" at $open, skipping quoted strings and identifiers. */
+    private static function matching_paren($s, $open)
+    {
+        $depth = 0;
+        $n = strlen($s);
+        for ($i = $open; $i < $n; $i++) {
+            $c = $s[$i];
+            if ($c === "'" || $c === '"' || $c === '`') {
+                for ($i++; $i < $n; $i++) {
+                    if ($s[$i] === '\\' && $c !== '`') {
+                        $i++;
+                    } elseif ($s[$i] === $c) {
+                        if ($i + 1 < $n && $s[$i + 1] === $c) {
+                            $i++;          // doubled quote
+                        } else {
+                            break;
+                        }
+                    }
                 }
-                if ($token !== null) {
-                    $stmt = str_replace($token, '%', $stmt);
+            } elseif ($c === '(') {
+                $depth++;
+            } elseif ($c === ')') {
+                $depth--;
+                if ($depth === 0) {
+                    return $i;
                 }
-                $wpdb->query($stmt);
-                $count++;
             }
         }
-        fclose($fh);
+        return null;
+    }
+
+    /** Throws on the first statement PAIO would refuse. Runs nothing. */
+    public static function validate($sql_path, array $source)
+    {
+        global $wpdb;
+        foreach (self::statements($sql_path, $source) as $no => $stmt) {
+            $problem = self::statement_problem($stmt, $wpdb->prefix);
+            if ($problem !== null) {
+                throw new RuntimeException(sprintf(
+                    'Database dump refused, nothing was imported. Statement %d: %s (%s)',
+                    $no, $problem, substr($stmt, 0, 120)
+                ));
+            }
+        }
+    }
+
+    /**
+     * Import a .sql dump, rewriting the source prefix to this site's prefix and the source
+     * site URL to this site's URL (serialization-safe). $source is the manifest array.
+     * Validated first, then executed one statement at a time via $wpdb::query.
+     * Returns ['queries'=>N, 'errors'=>[first 20 database errors]].
+     */
+    public static function import($sql_path, array $source)
+    {
+        global $wpdb;
+
+        self::validate($sql_path, $source);
+
+        $dst_url  = untrailingslashit(site_url());
+        $dst_home = untrailingslashit(home_url());
+        $src_url  = isset($source['siteurl']) ? untrailingslashit($source['siteurl']) : '';
+        $src_home = isset($source['home']) ? untrailingslashit($source['home']) : '';
+
+        $count = 0;
+        $errors = array();
+        $suppress = $wpdb->suppress_errors(true);
+        foreach (self::statements($sql_path, $source) as $no => $stmt) {
+            if ($wpdb->query($stmt) === false && count($errors) < 20) {
+                $errors[] = 'statement ' . $no . ': ' . $wpdb->last_error;
+            }
+            $count++;
+        }
+        $wpdb->suppress_errors($suppress);
 
         // After load, fix URLs across the DB (handles serialized data correctly).
         if ($src_url && $src_url !== $dst_url) {
@@ -159,7 +314,7 @@ class PAIO_Database
         update_option('siteurl', $dst_url);
         update_option('home', $dst_home);
 
-        return $count;
+        return array('queries' => $count, 'errors' => $errors);
     }
 
     /** Rewrite `src_prefix...` table identifiers to the destination prefix (backtick-quoted only). */
@@ -176,7 +331,7 @@ class PAIO_Database
 
     /**
      * Serialization-safe search/replace across all site tables' text columns.
-     * Walks each row, applies a recursive replace that re-counts serialized string lengths.
+     * Walks each row and rewrites serialized string lengths where the text changes.
      */
     public static function search_replace($search, $replace)
     {
@@ -203,11 +358,12 @@ class PAIO_Database
             if (!$pk || !$text_cols) {
                 continue;
             }
+            $order = self::order_by($table);
             $offset = 0;
             $batch = 500;
             do {
                 $rows = $wpdb->get_results(
-                    $wpdb->prepare('SELECT * FROM `' . $table . '` LIMIT %d OFFSET %d', $batch, $offset),
+                    $wpdb->prepare('SELECT * FROM `' . $table . '`' . $order . ' LIMIT %d OFFSET %d', $batch, $offset),
                     ARRAY_A
                 );
                 if ($rows) {
@@ -217,7 +373,7 @@ class PAIO_Database
                             if (!isset($row[$col]) || strpos($row[$col], $search) === false) {
                                 continue;
                             }
-                            $new = self::recursive_replace($search, $replace, $row[$col]);
+                            $new = self::replace_value($search, $replace, $row[$col]);
                             if ($new !== $row[$col]) {
                                 $update[$col] = $new;
                             }
@@ -234,37 +390,126 @@ class PAIO_Database
         return $changed;
     }
 
-    /** Unserialize if possible, replace within, re-serialize (keeps string lengths valid). */
-    private static function recursive_replace($search, $replace, $data)
+    /**
+     * Replaces $search in a stored value. Serialized data is rewritten token by token with string
+     * lengths recomputed, without unserialize(): the dump is untrusted, and unserializing it would
+     * instantiate whatever classes it names (PHP object injection). Strings that are themselves
+     * serialized are handled recursively. Malformed serialized data falls back to a plain replace.
+     */
+    public static function replace_value($search, $replace, $data)
     {
-        if (is_string($data)) {
-            $un = @unserialize($data);
-            if ($un !== false || $data === 'b:0;') {
-                return serialize(self::walk($search, $replace, $un));
-            }
-            return str_replace($search, $replace, $data);
+        if (!is_string($data)) {
+            return $data;
         }
-        return self::walk($search, $replace, $data);
+        if (function_exists('is_serialized') ? is_serialized($data) : preg_match('/^[aOsibdNCE][:;]/', $data)) {
+            $pos = 0;
+            $out = self::ser_value($data, $pos, $search, $replace, 0);
+            if ($out !== null && $pos === strlen($data)) {
+                return $out;
+            }
+        }
+        return str_replace($search, $replace, $data);
     }
 
-    private static function walk($search, $replace, $value)
+    /** Parses one serialized value at $p, returning it with replacements applied, or null if malformed. */
+    private static function ser_value($s, &$p, $search, $replace, $depth)
     {
-        if (is_string($value)) {
-            return str_replace($search, $replace, $value);
+        $n = strlen($s);
+        if ($depth > 256 || $p >= $n) {
+            return null;
         }
-        if (is_array($value)) {
-            $out = array();
-            foreach ($value as $k => $v) {
-                $out[is_string($k) ? str_replace($search, $replace, $k) : $k] = self::walk($search, $replace, $v);
+        $t = $s[$p];
+        if ($t === 'N') {
+            if (substr($s, $p, 2) !== 'N;') {
+                return null;
             }
+            $p += 2;
+            return 'N;';
+        }
+        if ($t === 'b' || $t === 'i' || $t === 'd' || $t === 'r' || $t === 'R') {
+            if (!preg_match('/\G[bidrR]:[^;]{1,64};/', $s, $m, 0, $p)) {
+                return null;
+            }
+            $p += strlen($m[0]);
+            return $m[0];
+        }
+        if ($t === 's') {
+            if (!preg_match('/\Gs:(\d+):"/', $s, $m, 0, $p)) {
+                return null;
+            }
+            $len = (int) $m[1];
+            $start = $p + strlen($m[0]);
+            if ($start + $len + 2 > $n || substr($s, $start + $len, 2) !== '";') {
+                return null;
+            }
+            $str = substr($s, $start, $len);
+            $p = $start + $len + 2;
+            $new = self::replace_value($search, $replace, $str);
+            return 's:' . strlen($new) . ':"' . $new . '";';
+        }
+        if ($t === 'a' || $t === 'O') {
+            if ($t === 'a') {
+                if (!preg_match('/\Ga:(\d+):\{/', $s, $m, 0, $p)) {
+                    return null;
+                }
+                $head = $m[0];
+                $count = (int) $m[1];
+            } else {
+                if (!preg_match('/\GO:(\d+):"/', $s, $m, 0, $p)) {
+                    return null;
+                }
+                $nlen = (int) $m[1];
+                $after = $p + strlen($m[0]) + $nlen;
+                if (!preg_match('/\G":(\d+):\{/', $s, $m2, 0, $after)) {
+                    return null;
+                }
+                $head = substr($s, $p, $after - $p) . $m2[0];
+                $count = (int) $m2[1];
+            }
+            $p += strlen($head);
+            $out = $head;
+            for ($i = 0; $i < $count * 2; $i++) {
+                $v = self::ser_value($s, $p, $search, $replace, $depth + 1);
+                if ($v === null) {
+                    return null;
+                }
+                $out .= $v;
+            }
+            if ($p >= $n || $s[$p] !== '}') {
+                return null;
+            }
+            $p++;
+            return $out . '}';
+        }
+        if ($t === 'C') {
+            // Custom-serialized object: its payload format is the class's own, copy it verbatim.
+            if (!preg_match('/\GC:(\d+):"/', $s, $m, 0, $p)) {
+                return null;
+            }
+            $after = $p + strlen($m[0]) + (int) $m[1];
+            if (!preg_match('/\G":(\d+):\{/', $s, $m2, 0, $after)) {
+                return null;
+            }
+            $end = $after + strlen($m2[0]) + (int) $m2[1];
+            if ($end >= $n || $s[$end] !== '}') {
+                return null;
+            }
+            $out = substr($s, $p, $end + 1 - $p);
+            $p = $end + 1;
             return $out;
         }
-        if (is_object($value)) {
-            foreach (get_object_vars($value) as $k => $v) {
-                $value->$k = self::walk($search, $replace, $v);
+        if ($t === 'E') {
+            if (!preg_match('/\GE:(\d+):"/', $s, $m, 0, $p)) {
+                return null;
             }
-            return $value;
+            $end = $p + strlen($m[0]) + (int) $m[1];
+            if (substr($s, $end, 2) !== '";') {
+                return null;
+            }
+            $out = substr($s, $p, $end + 2 - $p);
+            $p = $end + 2;
+            return $out;
         }
-        return $value;
+        return null;
     }
 }

@@ -224,10 +224,15 @@
         }
         var $s = $('#paio-upload-status');
         setStatus($s, 'Importing ' + file + '… (do not close this tab)', 'busy');
-        post('import', { file: file }, function (d) {
+        var dbOnly = $('#paio-db-only').is(':checked');
+        post('import', { file: file, skip_files: dbOnly ? 1 : '' }, function (d) {
             var msg = 'Imported: ' + d.files + ' files, ' + d.queries + ' statements' + (d.from ? ' (from ' + d.from + ')' : '');
+            var warn = !!(d.failed || d.refused || (d.db_errors && d.db_errors.length) || (d.dropins && d.dropins.length));
             if (d.failed) { msg += ' — ' + d.failed + ' file(s) skipped (unwritable)'; }
-            setStatus($s, msg, d.failed ? 'busy' : 'ok');
+            if (d.refused) { msg += ' — ' + d.refused + ' file(s) refused for safety: ' + (d.refused_list || []).join(', '); }
+            if (d.dropins && d.dropins.length) { msg += ' — drop-ins restored, check them: ' + d.dropins.join(', '); }
+            if (d.db_errors && d.db_errors.length) { msg += ' — database errors: ' + d.db_errors.join(' | '); }
+            setStatus($s, msg, warn ? 'busy' : 'ok');
         }, function (m) {
             setStatus($s, m, 'err');
         });

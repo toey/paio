@@ -81,6 +81,11 @@ class PAIO_Archive_Reader
         if (!is_dir($dir)) {
             wp_mkdir_p($dir);
         }
+        // Replace a symlink rather than write through it (what tar does): the archive should
+        // never be able to reach a file outside wp-content via a link that happens to exist here.
+        if (is_link($dest)) {
+            @unlink($dest);
+        }
         $out = @fopen($dest, 'wb');
         if (!$out) {
             // Non-fatal: one unwritable target (e.g. a root-owned or locked file) should not

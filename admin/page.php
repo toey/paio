@@ -24,6 +24,8 @@ $php_max = ini_get('max_execution_time');
             <button class="button" id="paio-upload">Upload</button>
             <span id="paio-upload-status" class="paio-status"></span>
         </p>
+        <p><label><input type="checkbox" id="paio-db-only"> Database only (leave wp-content files as they are)</label></p>
+        <p class="description">For safety, executable files are restored only into plugins/, themes/, mu-plugins/ and languages/; <code>.user.ini</code>/<code>php.ini</code> and any <code>.htaccess</code> that maps handlers are refused.<?php if (defined('DISALLOW_FILE_MODS') && DISALLOW_FILE_MODS) : ?> <strong>This site sets DISALLOW_FILE_MODS: only a database-only import is possible here; restore files with WP-CLI.</strong><?php endif; ?></p>
         <?php if ($php_max && (int) $php_max > 0) : ?>
         <p class="description">Server <code>max_execution_time</code> is <?php echo (int) $php_max; ?>s. For large sites, import from WP-CLI instead: <code>wp paio import &lt;file&gt;</code>.</p>
         <?php endif; ?>

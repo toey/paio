@@ -21,7 +21,6 @@ class PAIO_Admin
         // Authenticated AJAX only. No nopriv counterparts — by design.
         add_action('wp_ajax_paio_export', array(__CLASS__, 'ajax_export'));
         add_action('wp_ajax_paio_import', array(__CLASS__, 'ajax_import'));
-        add_action('wp_ajax_paio_upload', array(__CLASS__, 'ajax_upload'));
         add_action('wp_ajax_paio_upload_chunk', array(__CLASS__, 'ajax_upload_chunk'));
         add_action('wp_ajax_paio_list',   array(__CLASS__, 'ajax_list'));
         add_action('wp_ajax_paio_download', array(__CLASS__, 'ajax_download'));
@@ -82,43 +81,11 @@ class PAIO_Admin
                 'files' => $res['files'],
                 'tables' => $res['tables'],
                 'size'  => size_format($res['bytes']),
+                'links_skipped' => count($res['links_skipped']),
             ));
         } catch (Throwable $e) {
             wp_send_json_error(array('message' => $e->getMessage()), 500);
         }
-    }
-
-    /** Receive an uploaded .paio file into the protected storage dir. */
-    public static function ajax_upload()
-    {
-        PAIO_Security::check_ajax('upload');
-        if (empty($_FILES['archive']) || !isset($_FILES['archive']['tmp_name'])) {
-            wp_send_json_error(array('message' => 'No file received.'), 400);
-        }
-        $f = $_FILES['archive'];
-        if (!empty($f['error'])) {
-            wp_send_json_error(array('message' => 'Upload error code ' . (int) $f['error']), 400);
-        }
-        if (!is_uploaded_file($f['tmp_name'])) {
-            wp_send_json_error(array('message' => 'Invalid upload.'), 400);
-        }
-        $name = sanitize_file_name(basename($f['name']));
-        if (strtolower(pathinfo($name, PATHINFO_EXTENSION)) !== PAIO_ARCHIVE_EXT) {
-            wp_send_json_error(array('message' => 'Only .' . PAIO_ARCHIVE_EXT . ' archives are accepted.'), 400);
-        }
-        // Verify the magic before trusting it.
-        $fh = fopen($f['tmp_name'], 'rb');
-        $magic = $fh ? rtrim((string) fgets($fh), "\r\n") : '';
-        if ($fh) { fclose($fh); }
-        if ($magic !== PAIO_ARCHIVE_MAGIC) {
-            wp_send_json_error(array('message' => 'File is not a valid PAIO archive.'), 400);
-        }
-        $dir = PAIO_Security::ensure_storage();
-        $dest = $dir . '/' . $name;
-        if (!move_uploaded_file($f['tmp_name'], $dest)) {
-            wp_send_json_error(array('message' => 'Could not store the uploaded file.'), 500);
-        }
-        wp_send_json_success(array('file' => $name, 'size' => size_format(filesize($dest))));
     }
 
     /**
@@ -260,12 +227,21 @@ class PAIO_Admin
             $res = PAIO_Importer::run($path, array(
                 'skip_db'    => !empty($_POST['skip_db']),
                 'skip_files' => !empty($_POST['skip_files']),
+                'via'        => 'gui',
             ));
+            $refused = array();
+            foreach (array_slice($res['refused'], 0, 20) as $r) {
+                $refused[] = $r[0] . ' (' . $r[1] . ')';
+            }
             wp_send_json_success(array(
-                'files'   => $res['files'],
-                'failed'  => count($res['failed']),
-                'queries' => $res['queries'],
-                'from'    => $res['from'],
+                'files'     => $res['files'],
+                'failed'    => count($res['failed']),
+                'refused'   => count($res['refused']),
+                'refused_list' => $refused,
+                'dropins'   => $res['dropins'],
+                'queries'   => $res['queries'],
+                'db_errors' => $res['db_errors'],
+                'from'      => $res['from'],
             ));
         } catch (Throwable $e) {
             wp_send_json_error(array('message' => $e->getMessage()), 500);

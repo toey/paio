@@ -53,7 +53,8 @@ class PAIO_Exporter
         $writer->add_file($sql_tmp, 'database.sql');
         @unlink($sql_tmp);
 
-        $files = self::add_wp_content($writer);
+        $links = array();
+        $files = self::add_wp_content($writer, $links);
         $writer->close();
 
         return array(
@@ -61,25 +62,37 @@ class PAIO_Exporter
             'files'  => $files,
             'tables' => $tables,
             'bytes'  => filesize($dest_path),
+            'links_skipped' => $links,
         );
     }
 
-    /** Recursively add wp-content, skipping the storage dir and caches. Returns file count. */
-    private static function add_wp_content(PAIO_Archive_Writer $writer)
+    /**
+     * Recursively add wp-content, skipping the storage dir and caches. Returns file count.
+     * Symlinks are not followed (0.1.5): following them could pull files from outside
+     * wp-content - another account's tree, or /etc - into an archive, or loop forever. Skipped
+     * links are returned in $links so the operator can copy those targets separately.
+     */
+    private static function add_wp_content(PAIO_Archive_Writer $writer, array &$links)
     {
         $root = WP_CONTENT_DIR;
         $count = 0;
         $it = new RecursiveIteratorIterator(
-            new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS | FilesystemIterator::FOLLOW_SYMLINKS),
-            RecursiveIteratorIterator::LEAVES_ONLY
+            new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS),
+            RecursiveIteratorIterator::SELF_FIRST
         );
         foreach ($it as $file) {
-            if (!$file->isFile()) {
-                continue;
-            }
             $abs = $file->getPathname();
             $rel = 'wp-content/' . ltrim(str_replace('\\', '/', substr($abs, strlen($root))), '/');
             $inner = substr($rel, strlen('wp-content/'));
+            if ($file->isLink()) {
+                if (!PAIO_Security::should_skip($inner)) {
+                    $links[] = $rel;
+                }
+                continue;
+            }
+            if (!$file->isFile()) {
+                continue;
+            }
             if (PAIO_Security::should_skip($inner)) {
                 continue;
             }

@@ -15,7 +15,7 @@ $f = tempnam(sys_get_temp_dir(), 'paio');
 file_put_contents($f, "CREATE TABLE `$t` (id int primary key, v longtext);\n"
     . "INSERT INTO `$t` (`id`,`v`) VALUES (1,'" . esc_sql(str_replace('%', 'TOKEN', $val)) . "');\n");
 file_put_contents($f, str_replace('TOKEN', $tok, file_get_contents($f)));
-PAIO_Database::import($f, array('prefix' => $wpdb->prefix, 'siteurl' => site_url(), 'home' => home_url()));
+PAIO_Database::import($f, array('generator' => 'PAIO 0.1.1', 'prefix' => $wpdb->prefix, 'siteurl' => site_url(), 'home' => home_url()));
 $got = $wpdb->get_var("SELECT v FROM `$t` WHERE id=1");
 $ok($got === $val, 'import restores a 0.1.1 token to %', $got);
 $wpdb->query("DROP TABLE IF EXISTS `$t`");

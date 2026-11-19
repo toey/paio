@@ -4,7 +4,7 @@
  * This is the safest way to migrate large sites (no web timeout, no web attack surface).
  *
  *   wp paio export [<file>]
- *   wp paio import <file> [--skip-db] [--skip-files] [--yes]
+ *   wp paio import <file> [--skip-db] [--skip-files] [--allow-php-anywhere] [--yes]
  *   wp paio list
  */
 
@@ -28,6 +28,12 @@ class PAIO_CLI
         $dest = isset($args[0]) ? $args[0] : null;
         WP_CLI::log('Exporting ' . home_url() . ' ...');
         $res = PAIO_Exporter::run($dest);
+        if (!empty($res['links_skipped'])) {
+            WP_CLI::warning(sprintf('%d symlink(s) were not followed and are NOT in the archive:', count($res['links_skipped'])));
+            foreach (array_slice($res['links_skipped'], 0, 20) as $l) {
+                WP_CLI::log('  - ' . $l);
+            }
+        }
         WP_CLI::success(sprintf(
             'Exported %d files + %d tables -> %s (%s)',
             $res['files'], $res['tables'], $res['path'], size_format($res['bytes'])
@@ -47,6 +53,11 @@ class PAIO_CLI
      * [--skip-files]
      * : Restore the database only, leave wp-content untouched.
      *
+     * [--allow-php-anywhere]
+     * : Also restore executable files (php, phtml, phar, inc...) outside plugins/, themes/,
+     * mu-plugins/ and languages/ - e.g. under uploads/. Off by default: that is where webshells
+     * live. Use only for an archive you have checked.
+     *
      * [--yes]
      * : Skip the confirmation prompt.
      *
@@ -64,7 +75,27 @@ class PAIO_CLI
         $res = PAIO_Importer::run($file, array(
             'skip_db'    => (bool) WP_CLI\Utils\get_flag_value($assoc, 'skip-db', false),
             'skip_files' => (bool) WP_CLI\Utils\get_flag_value($assoc, 'skip-files', false),
+            'allow_php_anywhere' => (bool) WP_CLI\Utils\get_flag_value($assoc, 'allow-php-anywhere', false),
+            'via'        => 'cli',
         ));
+        if (!empty($res['refused'])) {
+            WP_CLI::warning(sprintf('%d file(s) refused for safety (not restored):', count($res['refused'])));
+            foreach (array_slice($res['refused'], 0, 30) as $r) {
+                WP_CLI::log('  - ' . $r[0] . '  [' . $r[1] . ']');
+            }
+            if (count($res['refused']) > 30) {
+                WP_CLI::log('  ... and ' . (count($res['refused']) - 30) . ' more');
+            }
+        }
+        if (!empty($res['dropins'])) {
+            WP_CLI::warning('Drop-ins restored (they run before every plugin - check them): ' . implode(', ', $res['dropins']));
+        }
+        if (!empty($res['db_errors'])) {
+            WP_CLI::warning(sprintf('%d database statement(s) failed (first ones shown):', count($res['db_errors'])));
+            foreach ($res['db_errors'] as $e) {
+                WP_CLI::log('  - ' . $e);
+            }
+        }
         if (!empty($res['failed'])) {
             WP_CLI::warning(sprintf('%d file(s) could not be written (skipped):', count($res['failed'])));
             foreach (array_slice($res['failed'], 0, 10) as $f) {
