@@ -28,6 +28,13 @@ class PAIO_Importer
             throw new RuntimeException('Archive not found or unreadable.');
         }
 
+        // Pass 0 (0.1.4): structure check first, so a damaged archive is refused with a clear
+        // message before anything is written.
+        $bad = PAIO_Archive_Reader::verify($archive_path);
+        if ($bad !== null) {
+            throw new RuntimeException('Archive is damaged, nothing was imported: ' . $bad . '. Copy or download it again.');
+        }
+
         // Pass 1: read + validate the manifest.
         $reader = new PAIO_Archive_Reader();
         $reader->open($archive_path);

@@ -3,7 +3,7 @@
  * Plugin Name: PAIO Migration
  * Plugin URI:  https://police.go.th/
  * Description: In-house full-site migration (database + wp-content) for the RTP fleet. A clean, authenticated replacement for the cracked "All-In-One WP Migration With Import" plugin. Export/import from WP-CLI or the wp-admin GUI using one shared engine.
- * Version:     0.1.2
+ * Version:     0.1.4
  * Author:      RTP NSOC
  * License:     GPL-2.0-or-later
  * Requires PHP: 7.0
@@ -25,7 +25,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('PAIO_VERSION', '0.1.2');
+define('PAIO_VERSION', '0.1.4');
 define('PAIO_FILE', __FILE__);
 define('PAIO_DIR', plugin_dir_path(__FILE__));
 define('PAIO_URL', plugin_dir_url(__FILE__));

@@ -22,6 +22,7 @@ class PAIO_Admin
         add_action('wp_ajax_paio_export', array(__CLASS__, 'ajax_export'));
         add_action('wp_ajax_paio_import', array(__CLASS__, 'ajax_import'));
         add_action('wp_ajax_paio_upload', array(__CLASS__, 'ajax_upload'));
+        add_action('wp_ajax_paio_upload_chunk', array(__CLASS__, 'ajax_upload_chunk'));
         add_action('wp_ajax_paio_list',   array(__CLASS__, 'ajax_list'));
         add_action('wp_ajax_paio_download', array(__CLASS__, 'ajax_download'));
         add_action('wp_ajax_paio_delete', array(__CLASS__, 'ajax_delete'));
@@ -40,8 +41,16 @@ class PAIO_Admin
             return;
         }
         wp_enqueue_script('paio', PAIO_URL . 'admin/js/paio.js', array('jquery'), PAIO_VERSION, true);
+        // Chunk size for browser uploads: well under post_max_size/upload_max_filesize (64 MB here) and
+        // under typical CDN/WAF request-body limits. 1 GB+ archives go up as ~8 MB requests.
+        $max = (int) wp_max_upload_size();
+        $chunk = 8 * 1024 * 1024;
+        if ($max > 0 && $chunk > $max - 524288) {
+            $chunk = max(1048576, $max - 524288);
+        }
         wp_localize_script('paio', 'PAIO', array(
             'ajax'   => admin_url('admin-ajax.php'),
+            'chunk'  => $chunk,
             'nonces' => array(
                 'export'   => wp_create_nonce('paio_export'),
                 'import'   => wp_create_nonce('paio_import'),
@@ -110,6 +119,133 @@ class PAIO_Admin
             wp_send_json_error(array('message' => 'Could not store the uploaded file.'), 500);
         }
         wp_send_json_success(array('file' => $name, 'size' => size_format(filesize($dest))));
+    }
+
+    /**
+     * Chunked upload (0.1.3): the browser sends the archive in pieces of PAIO.chunk bytes, in order.
+     * Each piece is appended to a hidden ".upload-<id>.partial" file in the protected storage dir; the
+     * last piece renames it to its .paio name. A retried piece that was already appended is accepted
+     * (idempotent), any other offset mismatch answers 409 with the expected offset so the client resumes.
+     * Same gates as every PAIO action: manage_options + nonce, archive magic checked on the first piece.
+     */
+    public static function ajax_upload_chunk()
+    {
+        PAIO_Security::check_ajax('upload');
+        $id = isset($_POST['upload_id']) ? (string) wp_unslash($_POST['upload_id']) : '';
+        if (!preg_match('/^[a-f0-9]{32}$/', $id)) {
+            wp_send_json_error(array('message' => 'Invalid upload id.'), 400);
+        }
+        $name = isset($_POST['name']) ? sanitize_file_name(basename(wp_unslash($_POST['name']))) : '';
+        if ($name === '' || strtolower(pathinfo($name, PATHINFO_EXTENSION)) !== PAIO_ARCHIVE_EXT) {
+            wp_send_json_error(array('message' => 'Only .' . PAIO_ARCHIVE_EXT . ' archives are accepted.'), 400);
+        }
+        $offset = isset($_POST['offset']) ? (int) $_POST['offset'] : -1;
+        $total  = isset($_POST['total']) ? (int) $_POST['total'] : 0;
+        $last   = !empty($_POST['last']);
+        if ($offset < 0 || $total <= 0 || $offset >= $total) {
+            wp_send_json_error(array('message' => 'Invalid chunk offset.'), 400);
+        }
+        if (empty($_FILES['chunk']) || !empty($_FILES['chunk']['error']) || !is_uploaded_file($_FILES['chunk']['tmp_name'])) {
+            $code = isset($_FILES['chunk']['error']) ? (int) $_FILES['chunk']['error'] : 0;
+            wp_send_json_error(array('message' => 'Chunk not received (error ' . $code . ').'), 400);
+        }
+        $tmp = $_FILES['chunk']['tmp_name'];
+        $len = (int) filesize($tmp);
+
+        // 0.1.4: the browser sends the SHA-256 of each piece. 2026-11-16 a 1.2 GB upload through the
+        // CDN/WAF arrived with the right size but 26 of 154 pieces altered inside, so the archive was
+        // unusable. A piece that does not match is refused (422) and the browser resends it.
+        $want = isset($_POST['sha256']) ? strtolower((string) wp_unslash($_POST['sha256'])) : '';
+        if ($want !== '') {
+            if (!preg_match('/^[a-f0-9]{64}$/', $want)) {
+                wp_send_json_error(array('message' => 'Invalid chunk checksum.'), 400);
+            }
+            if (!hash_equals($want, (string) hash_file('sha256', $tmp))) {
+                wp_send_json_error(array('message' => 'Piece damaged in transit (checksum mismatch).', 'corrupt' => true), 422);
+            }
+        }
+
+        $dir  = PAIO_Security::ensure_storage();
+        $part = $dir . '/.upload-' . $id . '.partial';
+
+        // Housekeeping: abandoned partial uploads older than 24 h.
+        if ($offset === 0) {
+            foreach (glob($dir . '/.upload-*.partial') ?: array() as $old) {
+                if (is_file($old) && filemtime($old) < time() - DAY_IN_SECONDS) {
+                    @unlink($old);
+                }
+            }
+            $fh = fopen($tmp, 'rb');
+            $magic = $fh ? rtrim((string) fgets($fh), "\r\n") : '';
+            if ($fh) { fclose($fh); }
+            if ($magic !== PAIO_ARCHIVE_MAGIC) {
+                wp_send_json_error(array('message' => 'File is not a valid PAIO archive.'), 400);
+            }
+        }
+
+        $out = fopen($part, 'c+b');
+        if (!$out || !flock($out, LOCK_EX)) {
+            wp_send_json_error(array('message' => 'Could not open the upload buffer.'), 500);
+        }
+        clearstatcache(true, $part);
+        $have = (int) filesize($part);
+        if ($offset !== $have) {
+            if ($offset + $len === $have) {          // a retry of a piece we already appended
+                flock($out, LOCK_UN); fclose($out);
+                self::finish_chunk($part, $dir, $name, $have, $total, $last);
+            }
+            flock($out, LOCK_UN); fclose($out);
+            wp_send_json_error(array('message' => 'Out of order chunk.', 'expected' => $have), 409);
+        }
+        if ($have + $len > $total) {
+            flock($out, LOCK_UN); fclose($out);
+            wp_send_json_error(array('message' => 'Chunk exceeds the declared size.'), 400);
+        }
+        $in = fopen($tmp, 'rb');
+        fseek($out, $have);
+        while ($in && !feof($in)) {
+            $buf = fread($in, 1048576);
+            if ($buf === false || $buf === '') {
+                break;
+            }
+            if (fwrite($out, $buf) !== strlen($buf)) {
+                fclose($in); flock($out, LOCK_UN); fclose($out);
+                wp_send_json_error(array('message' => 'Write failed (disk full or quota?).'), 507);
+            }
+        }
+        if ($in) { fclose($in); }
+        fflush($out);
+        flock($out, LOCK_UN);
+        fclose($out);
+        clearstatcache(true, $part);
+        self::finish_chunk($part, $dir, $name, (int) filesize($part), $total, $last);
+    }
+
+    /** Reply for a stored chunk; on the last one, move the completed buffer to its .paio name. */
+    private static function finish_chunk($part, $dir, $name, $have, $total, $last)
+    {
+        if (!$last) {
+            wp_send_json_success(array('received' => $have));
+        }
+        if ($have !== $total) {
+            wp_send_json_error(array('message' => 'Upload incomplete (' . $have . ' of ' . $total . ' bytes).', 'expected' => $have), 409);
+        }
+        // Whole-archive structure check before it is listed as importable. Every piece was already
+        // checksum-verified, so a failure here means the file was damaged before the upload began.
+        $bad = PAIO_Archive_Reader::verify($part);
+        if ($bad !== null) {
+            @unlink($part);
+            wp_send_json_error(array('message' => 'The archive is damaged: ' . $bad . '. The file on your computer is already corrupt. Download it again (and check its SHA-256), then upload again.'), 422);
+        }
+        $base = substr($name, 0, -strlen('.' . PAIO_ARCHIVE_EXT));
+        $dest = $dir . '/' . $name;
+        for ($i = 1; file_exists($dest) && $i < 1000; $i++) {
+            $dest = $dir . '/' . $base . '-' . $i . '.' . PAIO_ARCHIVE_EXT;
+        }
+        if (!rename($part, $dest)) {
+            wp_send_json_error(array('message' => 'Could not store the uploaded file.'), 500);
+        }
+        wp_send_json_success(array('file' => basename($dest), 'size' => size_format(filesize($dest)), 'done' => true));
     }
 
     public static function ajax_import()

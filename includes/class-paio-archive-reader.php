@@ -138,6 +138,62 @@ class PAIO_Archive_Reader
         return $data;
     }
 
+    /**
+     * Structure check without extracting anything (0.1.4): walks every header and seeks over the
+     * payloads, so a 1 GB archive is checked in about a second. Returns null when the archive is
+     * intact, else a short description of where it breaks. Catches a file damaged in transit
+     * (download or upload), where the byte counts no longer line up with the headers.
+     */
+    public static function verify($path)
+    {
+        $fh = @fopen($path, 'rb');
+        if (!$fh) {
+            return 'cannot open the file';
+        }
+        $size = (int) filesize($path);
+        $magic = rtrim((string) fgets($fh), "\r\n");
+        if ($magic !== PAIO_ARCHIVE_MAGIC) {
+            fclose($fh);
+            return 'not a PAIO archive (bad magic)';
+        }
+        $prev = '(start of archive)';
+        $n = 0;
+        while (true) {
+            $pos = ftell($fh);
+            $line = fgets($fh);
+            if ($line === false) {
+                fclose($fh);
+                return 'no PAIO_END marker (file is truncated)';
+            }
+            $line = rtrim($line, "\r\n");
+            if ($line === 'PAIO_END') {
+                break;
+            }
+            if ($line === '') {
+                continue;
+            }
+            $h = json_decode($line, true);
+            if (!is_array($h) || !isset($h['path'], $h['size']) || (int) $h['size'] < 0) {
+                fclose($fh);
+                return 'bad header at byte ' . $pos . ', right after entry ' . $prev;
+            }
+            $end = ftell($fh) + (int) $h['size'];
+            if ($end + 1 > $size) {
+                fclose($fh);
+                return 'entry ' . $h['path'] . ' runs past the end of the file (truncated)';
+            }
+            fseek($fh, $end);
+            if (fread($fh, 1) !== "\n") {
+                fclose($fh);
+                return 'entry ' . $h['path'] . ' (header at byte ' . $pos . ') does not end where its size says';
+            }
+            $prev = $h['path'];
+            $n++;
+        }
+        fclose($fh);
+        return $n > 0 ? null : 'archive has no entries';
+    }
+
     public function close()
     {
         if ($this->fh) {

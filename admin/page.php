@@ -18,7 +18,7 @@ $php_max = ini_get('max_execution_time');
 
     <div class="card" style="max-width:none">
         <h2>Import an archive</h2>
-        <p>Upload a <code>.<?php echo esc_html(PAIO_ARCHIVE_EXT); ?></code> archive, then import it. <strong>Importing overwrites this site's wp-content and database.</strong></p>
+        <p>Upload a <code>.<?php echo esc_html(PAIO_ARCHIVE_EXT); ?></code> archive (any size; it is sent in small pieces), then import it. <strong>Importing overwrites this site's wp-content and database.</strong></p>
         <p>
             <input type="file" id="paio-file" accept=".<?php echo esc_attr(PAIO_ARCHIVE_EXT); ?>">
             <button class="button" id="paio-upload">Upload</button>
